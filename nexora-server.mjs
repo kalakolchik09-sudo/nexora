@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { randomBytes, createHash, scryptSync, timingSafeEqual } from 'node:crypto';
+import { randomBytes, createHash, createHmac, scryptSync, timingSafeEqual } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -13,6 +13,8 @@ const host = process.env.HOST || '127.0.0.1';
 const adminEmail = String(process.env.NEXORA_ADMIN_EMAIL || '').trim().toLowerCase();
 const adminPassword = String(process.env.NEXORA_ADMIN_PASSWORD || '');
 const isProduction = process.env.NODE_ENV === 'production';
+const cryptoPayToken = String(process.env.CRYPTO_PAY_API_TOKEN || '').trim();
+const cryptoPayApi = 'https://pay.crypt.bot/api';
 
 if (!adminEmail || adminPassword.length < 14) {
   console.error('Set NEXORA_ADMIN_EMAIL and a unique NEXORA_ADMIN_PASSWORD (14+ characters) before starting.');
@@ -55,7 +57,28 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS messages_thread_id_id ON messages(thread_id,id);
   CREATE INDEX IF NOT EXISTS threads_updated_at ON threads(updated_at DESC);
+  CREATE TABLE IF NOT EXISTS orders (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    product_id TEXT NOT NULL,
+    product_name TEXT NOT NULL,
+    amount_rub INTEGER NOT NULL,
+    invoice_id TEXT UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','paid','expired','cancelled')),
+    pay_url TEXT,
+    created_at TEXT NOT NULL,
+    paid_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS orders_user_created ON orders(user_id, created_at DESC);
 `);
+
+const products = Object.freeze({
+  client_1165: { name: 'NEXORA 1.16.5', amount: 449 },
+  client_12111: { name: 'NEXORA 1.21.11', amount: 449 },
+  bundle: { name: 'Всё в одном', amount: 1499 },
+  premium: { name: 'Premium 1.16.5', amount: 299 },
+  hwid_reset: { name: 'Сброс HWID', amount: 299 }
+});
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 function passwordHash(password, salt = randomBytes(16).toString('hex')) {
@@ -132,6 +155,32 @@ async function body(req) {
   try { return JSON.parse(raw); }
   catch { throw Object.assign(new Error('Invalid JSON'), { status: 400 }); }
 }
+async function rawBody(req, limit = 64_000) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw Object.assign(new Error('Request too large'), { status: 413 });
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+function safeEqualHex(a, b) {
+  if (!/^[a-f0-9]{64}$/i.test(a) || !/^[a-f0-9]{64}$/i.test(b)) return false;
+  const left = Buffer.from(a, 'hex'), right = Buffer.from(b, 'hex');
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+async function cryptoPay(method, payload) {
+  const response = await fetch(`${cryptoPayApi}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Crypto-Pay-API-Token': cryptoPayToken },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(12_000)
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.ok) throw new Error('Crypto Pay не смог создать счёт. Проверьте API-токен приложения.');
+  return data.result;
+}
 function requireUser(user) {
   if (!user) throw Object.assign(new Error('Войдите в аккаунт'), { status: 401 });
 }
@@ -155,9 +204,71 @@ const server = createServer(async (req, res) => {
       return res.end(readFileSync(htmlPath));
     }
     if (!url.pathname.startsWith('/api/')) return send(res, 404, { error: 'Not found' });
+
+    if (url.pathname === '/api/payments/config' && req.method === 'GET') {
+      return send(res, 200, { available: !!cryptoPayToken });
+    }
+    if (url.pathname === '/api/payments/crypto/webhook' && req.method === 'POST') {
+      if (!cryptoPayToken) return send(res, 503, { error: 'Payments are not configured' });
+      const raw = await rawBody(req);
+      const expected = createHash('sha256').update(cryptoPayToken).digest();
+      const supplied = String(req.headers['crypto-pay-api-signature'] || '');
+      const actual = createHmac('sha256', expected).update(raw).digest('hex');
+      if (!safeEqualHex(supplied, actual)) return send(res, 401, { error: 'Invalid signature' });
+      let update;
+      try { update = JSON.parse(raw.toString('utf8')); } catch { return send(res, 400, { error: 'Invalid JSON' }); }
+      if (update?.update_type !== 'invoice_paid' || update?.payload?.status !== 'paid') return send(res, 200, { ok: true });
+      const invoice = update.payload;
+      const orderId = String(invoice.payload || '');
+      const order = db.prepare('SELECT * FROM orders WHERE id=? AND invoice_id=?').get(orderId, String(invoice.invoice_id));
+      if (!order) return send(res, 200, { ok: true });
+      if (invoice.currency_type !== 'fiat' || invoice.fiat !== 'RUB' || Number(invoice.amount) !== order.amount_rub) {
+        return send(res, 400, { error: 'Invoice amount mismatch' });
+      }
+      if (order.status !== 'paid') {
+        const now = new Date().toISOString();
+        db.prepare("UPDATE orders SET status='paid',paid_at=? WHERE id=? AND status='pending'").run(now, order.id);
+        db.prepare('INSERT OR IGNORE INTO threads(user_id,updated_at) VALUES(?,?)').run(order.user_id, now);
+        const thread = getUserThread(order.user_id);
+        const admin = db.prepare("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").get();
+        if (thread && admin) db.prepare('INSERT INTO messages(thread_id,sender_id,text,created_at) VALUES(?,?,?,?)')
+          .run(thread.id, admin.id, `Оплата подтверждена: ${order.product_name} (${order.amount_rub} ₽). Заказ принят; напишите здесь, чтобы согласовать получение товара.`, now);
+      }
+      return send(res, 200, { ok: true });
+    }
     const user = currentUser(req);
 
     if (url.pathname === '/api/me' && req.method === 'GET') return send(res, 200, { user });
+    if (url.pathname === '/api/payments/crypto/create' && req.method === 'POST') {
+      requireUser(user);
+      if (!cryptoPayToken) return send(res, 503, { error: 'Оплата пока не настроена. Нужен API-токен приложения Crypto Pay.' });
+      const data = await body(req), product = products[String(data.productId || '')];
+      if (!product) return send(res, 400, { error: 'Товар не найден.' });
+      const orderId = randomBytes(18).toString('base64url');
+      const now = new Date().toISOString();
+      db.prepare('INSERT INTO orders(id,user_id,product_id,product_name,amount_rub,created_at) VALUES(?,?,?,?,?,?)')
+        .run(orderId, user.id, String(data.productId), product.name, product.amount, now);
+      try {
+        const invoice = await cryptoPay('createInvoice', {
+          currency_type: 'fiat', fiat: 'RUB', amount: String(product.amount), accepted_assets: 'USDT,TON,BTC,ETH',
+          description: `${product.name} — заказ ${orderId.slice(0, 8)}`, payload: orderId,
+          expires_in: 1800, allow_comments: false, allow_anonymous: false
+        });
+        if (!invoice?.invoice_id || !invoice?.bot_invoice_url) throw new Error('Провайдер не вернул ссылку на оплату.');
+        db.prepare('UPDATE orders SET invoice_id=?,pay_url=? WHERE id=?').run(String(invoice.invoice_id), invoice.bot_invoice_url, orderId);
+        return send(res, 201, { orderId, payUrl: invoice.bot_invoice_url, product: product.name, amount: product.amount });
+      } catch (error) {
+        db.prepare("UPDATE orders SET status='cancelled' WHERE id=?").run(orderId);
+        throw error;
+      }
+    }
+    if (url.pathname === '/api/payments/order' && req.method === 'GET') {
+      requireUser(user);
+      const order = db.prepare('SELECT id,product_name,amount_rub,status,created_at,paid_at FROM orders WHERE id=? AND user_id=?')
+        .get(String(url.searchParams.get('id') || ''), user.id);
+      if (!order) return send(res, 404, { error: 'Заказ не найден.' });
+      return send(res, 200, { order });
+    }
     if (url.pathname === '/api/register' && req.method === 'POST') {
       if (!allowRegistration(req)) return send(res, 429, { error: 'Слишком много регистраций с этого адреса. Попробуйте позже.' });
       const data = await body(req);

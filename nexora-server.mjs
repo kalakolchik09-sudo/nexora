@@ -281,16 +281,33 @@ const server = createServer(async (req, res) => {
         orders
       });
     }
-    if (url.pathname === '/api/profile/test-subscription' && req.method === 'POST') {
+    if (url.pathname === '/api/purchases/free-test' && req.method === 'POST') {
       requireUser(user);
-      const now = new Date();
-      const claimed = db.prepare('INSERT OR IGNORE INTO test_subscription_claims(user_id,claimed_at) VALUES(?,?)').run(user.id, now.toISOString());
-      if (!claimed.changes) return send(res, 409, { error: 'Тестовую подписку можно получить только один раз на аккаунт.' });
-      const expires = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
-      const id = randomBytes(18).toString('base64url');
-      db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,product_name,status,source_type,started_at,expires_at)
-        VALUES(?,?,?,'Тестовая подписка','active','test',?,?)`).run(id, user.id, 'test_access', now.toISOString(), expires);
-      return send(res, 201, { subscription: { id, product_id: 'test_access', product_name: 'Тестовая подписка', status: 'active', source_type: 'test', started_at: now.toISOString(), expires_at: expires } });
+      const now = new Date().toISOString();
+      const expires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      const orderId = randomBytes(18).toString('base64url');
+      const subscriptionId = randomBytes(18).toString('base64url');
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const claimed = db.prepare('INSERT OR IGNORE INTO test_subscription_claims(user_id,claimed_at) VALUES(?,?)').run(user.id, now);
+        if (!claimed.changes) {
+          db.exec('ROLLBACK');
+          return send(res, 409, { error: 'Тестовую подписку можно оформить только один раз на аккаунт.' });
+        }
+        db.prepare(`INSERT INTO orders(id,user_id,product_id,product_name,amount_rub,status,created_at,paid_at)
+          VALUES(?,?,'test_access','Тестовая подписка',0,'paid',?,?)`).run(orderId, user.id, now, now);
+        db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,product_name,status,source_type,source_order_id,started_at,expires_at)
+          VALUES(?,?,'test_access','Тестовая подписка','active','test',?,?,?)`)
+          .run(subscriptionId, user.id, orderId, now, expires);
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+      return send(res, 201, {
+        order: { id: orderId, product_name: 'Тестовая подписка', amount_rub: 0, status: 'paid', created_at: now, paid_at: now },
+        subscription: { id: subscriptionId, product_id: 'test_access', product_name: 'Тестовая подписка', status: 'active', source_type: 'test', started_at: now, expires_at: expires }
+      });
     }
     if (url.pathname === '/api/payments/crypto/create' && req.method === 'POST') {
       requireUser(user);

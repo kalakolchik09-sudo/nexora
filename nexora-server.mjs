@@ -87,6 +87,23 @@ db.exec(`
     user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     claimed_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS promo_codes (
+    code_hash TEXT PRIMARY KEY,
+    product_id TEXT NOT NULL CHECK (product_id IN ('client_1165','client_12111','bundle','premium','hwid_reset')),
+    max_uses INTEGER NOT NULL CHECK (max_uses BETWEEN 1 AND 1000),
+    used_count INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT,
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS promo_redemptions (
+    id TEXT PRIMARY KEY,
+    code_hash TEXT NOT NULL REFERENCES promo_codes(code_hash),
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    order_id TEXT NOT NULL UNIQUE REFERENCES orders(id),
+    redeemed_at TEXT NOT NULL,
+    UNIQUE(code_hash,user_id)
+  );
 `);
 
 if (!db.prepare('PRAGMA table_info(users)').all().some(column => column.name === 'last_login_at')) {
@@ -281,6 +298,84 @@ const server = createServer(async (req, res) => {
         orders,
         testSubscriptionClaimed: !!db.prepare('SELECT 1 FROM test_subscription_claims WHERE user_id=?').get(user.id)
       });
+    }
+    if (url.pathname === '/api/profile/subscriptions/cancel' && req.method === 'POST') {
+      requireUser(user);
+      const data = await body(req), password = String(data.password || ''), subscriptionId = String(data.subscriptionId || '');
+      if (!subscriptionId || password.length < 1 || password.length > 128) return send(res, 400, { error: 'Введите пароль аккаунта для подтверждения.' });
+      const account = db.prepare('SELECT password_salt,password_hash FROM users WHERE id=?').get(user.id);
+      if (!passwordMatches(password, account.password_salt, account.password_hash)) return send(res, 403, { error: 'Неверный пароль.' });
+      const subscription = db.prepare('SELECT id,status FROM subscriptions WHERE id=? AND user_id=?').get(subscriptionId, user.id);
+      if (!subscription) return send(res, 404, { error: 'Подписка не найдена.' });
+      if (subscription.status !== 'active') return send(res, 409, { error: 'Эта подписка уже не активна.' });
+      db.prepare("UPDATE subscriptions SET status='revoked' WHERE id=? AND user_id=? AND status='active'").run(subscriptionId, user.id);
+      return send(res, 200, { ok: true, message: 'Доступ отменён.' });
+    }
+    if (url.pathname === '/api/promo/redeem' && req.method === 'POST') {
+      requireUser(user);
+      const data = await body(req), code = String(data.code || '').replace(/\s+/g, '').toUpperCase();
+      if (!/^NX-[A-F0-9]{36}$/.test(code)) return send(res, 400, { error: 'Проверьте код и попробуйте ещё раз.' });
+      const codeHash = digest(code), now = new Date().toISOString(), orderId = randomBytes(18).toString('base64url');
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const promo = db.prepare('SELECT * FROM promo_codes WHERE code_hash=?').get(codeHash);
+        if (!promo) { db.exec('ROLLBACK'); return send(res, 404, { error: 'Такой промокод не найден.' }); }
+        if (promo.expires_at && Date.parse(promo.expires_at) <= Date.now()) { db.exec('ROLLBACK'); return send(res, 410, { error: 'Срок действия промокода истёк.' }); }
+        if (promo.used_count >= promo.max_uses) { db.exec('ROLLBACK'); return send(res, 409, { error: 'Лимит активаций этого кода исчерпан.' }); }
+        if (db.prepare('SELECT 1 FROM promo_redemptions WHERE code_hash=? AND user_id=?').get(codeHash, user.id)) {
+          db.exec('ROLLBACK'); return send(res, 409, { error: 'Вы уже использовали этот код.' });
+        }
+        const product = products[promo.product_id];
+        const orderName = promo.product_id === 'hwid_reset' ? 'Промокод · сброс HWID' : `Промокод · ${product.name}`;
+        db.prepare("INSERT INTO orders(id,user_id,product_id,product_name,amount_rub,status,created_at,paid_at) VALUES(?,?,?,?,0,'paid',?,?)")
+          .run(orderId, user.id, promo.product_id, orderName, now, now);
+        if (promo.product_id !== 'hwid_reset') {
+          db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,product_name,status,source_type,source_order_id,started_at,expires_at)
+            VALUES(?,?,?,?,'active','payment',?,?,NULL)`)
+            .run(randomBytes(18).toString('base64url'), user.id, promo.product_id, product.name, orderId, now);
+        } else {
+          db.prepare('INSERT OR IGNORE INTO threads(user_id,updated_at) VALUES(?,?)').run(user.id, now);
+          const thread = getUserThread(user.id), admin = db.prepare("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").get();
+          if (thread && admin) db.prepare('INSERT INTO messages(thread_id,sender_id,text,created_at) VALUES(?,?,?,?)')
+            .run(thread.id, admin.id, 'Пользователь активировал код на сброс HWID. Запрос передан поддержке.', now);
+        }
+        db.prepare('INSERT INTO promo_redemptions(id,code_hash,user_id,order_id,redeemed_at) VALUES(?,?,?,?,?)')
+          .run(randomBytes(18).toString('base64url'), codeHash, user.id, orderId, now);
+        db.prepare('UPDATE promo_codes SET used_count=used_count+1 WHERE code_hash=?').run(codeHash);
+        db.exec('COMMIT');
+        return send(res, 200, { ok: true, orderId, message: promo.product_id === 'hwid_reset' ? 'Код принят. Запрос на сброс HWID отправлен в поддержку.' : `Код принят. Доступ «${product.name}» активирован в профиле.` });
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+    }
+    if (url.pathname === '/api/admin/overview' && req.method === 'GET') {
+      requireAdmin(user);
+      const users = db.prepare(`SELECT id,username,email,role,created_at,last_login_at FROM users ORDER BY id DESC LIMIT 500`).all()
+        .map(row => ({ ...row, email: row.email.endsWith('.nexora.invalid') ? '' : row.email }));
+      const orders = db.prepare(`SELECT o.id,o.product_name,o.amount_rub,o.status,o.created_at,o.paid_at,u.username,u.email
+        FROM orders o JOIN users u ON u.id=o.user_id ORDER BY o.created_at DESC LIMIT 300`).all()
+        .map(row => ({ ...row, email: row.email.endsWith('.nexora.invalid') ? '' : row.email }));
+      const subscriptions = db.prepare(`SELECT s.id,s.product_name,s.status,s.source_type,s.started_at,s.expires_at,u.username,u.email
+        FROM subscriptions s JOIN users u ON u.id=s.user_id ORDER BY s.started_at DESC LIMIT 300`).all()
+        .map(row => ({ ...row, email: row.email.endsWith('.nexora.invalid') ? '' : row.email }));
+      const codes = db.prepare(`SELECT c.product_id,c.max_uses,c.used_count,c.expires_at,c.created_at,u.username AS creator,
+        (SELECT COUNT(*) FROM promo_redemptions r WHERE r.code_hash=c.code_hash) AS redemptions
+        FROM promo_codes c JOIN users u ON u.id=c.created_by ORDER BY c.created_at DESC LIMIT 300`).all();
+      return send(res, 200, { users, orders, subscriptions, codes });
+    }
+    if (url.pathname === '/api/admin/codes' && req.method === 'POST') {
+      requireAdmin(user);
+      const data = await body(req), productId = String(data.productId || ''), product = products[productId];
+      const maxUses = Number(data.maxUses || 1), expiresInDays = Number(data.expiresInDays || 0);
+      if (!product || productId === 'test_access') return send(res, 400, { error: 'Выберите действительный продукт для кода.' });
+      if (!Number.isInteger(maxUses) || maxUses < 1 || maxUses > 1000) return send(res, 400, { error: 'Число активаций должно быть от 1 до 1000.' });
+      if (!Number.isInteger(expiresInDays) || expiresInDays < 0 || expiresInDays > 3650) return send(res, 400, { error: 'Срок кода должен быть от 0 до 3650 дней.' });
+      const code = `NX-${randomBytes(18).toString('hex').toUpperCase()}`;
+      const expiresAt = expiresInDays ? new Date(Date.now() + expiresInDays * 86400_000).toISOString() : null;
+      db.prepare('INSERT INTO promo_codes(code_hash,product_id,max_uses,expires_at,created_by,created_at) VALUES(?,?,?,?,?,?)')
+        .run(digest(code), productId, maxUses, expiresAt, user.id, new Date().toISOString());
+      return send(res, 201, { code, product: product.name, maxUses, expiresAt });
     }
     if (url.pathname === '/api/purchases/free-test' && req.method === 'POST') {
       requireUser(user);

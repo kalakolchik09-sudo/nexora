@@ -1,0 +1,6 @@
+nexora.sqlite
+nexora.sqlite-*
+.env
+.env.*
+!.env.example
+node_modules/

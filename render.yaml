@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: nexora-site
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    disk:
+      name: nexora-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: NEXORA_DB
+        value: /var/data/nexora.sqlite
+      - key: NEXORA_ADMIN_EMAIL
+        sync: false
+      - key: NEXORA_ADMIN_PASSWORD
+        sync: false

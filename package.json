@@ -1,0 +1,11 @@
+{
+  "name": "nexora-site",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node nexora-server.mjs"
+  }
+}

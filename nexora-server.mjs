@@ -36,7 +36,8 @@ db.exec(`
     password_salt TEXT NOT NULL,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user','admin')),
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    last_login_at TEXT
   );
   CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
@@ -70,7 +71,28 @@ db.exec(`
     paid_at TEXT
   );
   CREATE INDEX IF NOT EXISTS orders_user_created ON orders(user_id, created_at DESC);
+  CREATE TABLE IF NOT EXISTS subscriptions (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    product_id TEXT NOT NULL,
+    product_name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active','expired','revoked')),
+    source_type TEXT NOT NULL CHECK (source_type IN ('payment','test')),
+    source_order_id TEXT UNIQUE,
+    started_at TEXT NOT NULL,
+    expires_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS subscriptions_user ON subscriptions(user_id, started_at DESC);
+  CREATE TABLE IF NOT EXISTS test_subscription_claims (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    claimed_at TEXT NOT NULL
+  );
 `);
+
+if (!db.prepare('PRAGMA table_info(users)').all().some(column => column.name === 'last_login_at')) {
+  db.exec('ALTER TABLE users ADD COLUMN last_login_at TEXT');
+}
+db.exec('UPDATE users SET last_login_at=created_at WHERE last_login_at IS NULL');
 
 const products = Object.freeze({
   client_1165: { name: 'NEXORA 1.16.5', amount: 449 },
@@ -228,17 +250,48 @@ const server = createServer(async (req, res) => {
       if (order.status !== 'paid') {
         const now = new Date().toISOString();
         db.prepare("UPDATE orders SET status='paid',paid_at=? WHERE id=? AND status='pending'").run(now, order.id);
+        if (order.product_id !== 'hwid_reset') {
+          db.prepare(`INSERT OR IGNORE INTO subscriptions(id,user_id,product_id,product_name,status,source_type,source_order_id,started_at,expires_at)
+            VALUES(?,?,?,?,'active','payment',?,?,NULL)`)
+            .run(randomBytes(18).toString('base64url'), order.user_id, order.product_id, order.product_name, order.id, now);
+        }
         db.prepare('INSERT OR IGNORE INTO threads(user_id,updated_at) VALUES(?,?)').run(order.user_id, now);
         const thread = getUserThread(order.user_id);
         const admin = db.prepare("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").get();
         if (thread && admin) db.prepare('INSERT INTO messages(thread_id,sender_id,text,created_at) VALUES(?,?,?,?)')
-          .run(thread.id, admin.id, `Оплата подтверждена: ${order.product_name} (${order.amount_rub} ₽). Заказ принят; напишите здесь, чтобы согласовать получение товара.`, now);
+          .run(thread.id, admin.id, order.product_id === 'hwid_reset'
+            ? `Оплата подтверждена: услуга «${order.product_name}» (${order.amount_rub} ₽). Обращение передано поддержке.`
+            : `Оплата подтверждена: ${order.product_name} (${order.amount_rub} ₽). Подписка активирована в аккаунте.`, now);
       }
       return send(res, 200, { ok: true });
     }
     const user = currentUser(req);
 
     if (url.pathname === '/api/me' && req.method === 'GET') return send(res, 200, { user });
+    if (url.pathname === '/api/profile' && req.method === 'GET') {
+      requireUser(user);
+      const account = db.prepare('SELECT id,username,email,role,created_at,last_login_at FROM users WHERE id=?').get(user.id);
+      const subscriptions = db.prepare(`SELECT id,product_id,product_name,status,source_type,started_at,expires_at
+        FROM subscriptions WHERE user_id=? ORDER BY started_at DESC`).all(user.id);
+      const orders = db.prepare(`SELECT id,product_name,amount_rub,status,created_at,paid_at
+        FROM orders WHERE user_id=? ORDER BY created_at DESC LIMIT 10`).all(user.id);
+      return send(res, 200, {
+        account: { ...account, email: account.email.endsWith('.nexora.invalid') ? '' : account.email, hwid: null },
+        subscriptions: subscriptions.map(item => ({ ...item, status: item.expires_at && Date.parse(item.expires_at) <= Date.now() && item.status === 'active' ? 'expired' : item.status })),
+        orders
+      });
+    }
+    if (url.pathname === '/api/profile/test-subscription' && req.method === 'POST') {
+      requireUser(user);
+      const now = new Date();
+      const claimed = db.prepare('INSERT OR IGNORE INTO test_subscription_claims(user_id,claimed_at) VALUES(?,?)').run(user.id, now.toISOString());
+      if (!claimed.changes) return send(res, 409, { error: 'Тестовую подписку можно получить только один раз на аккаунт.' });
+      const expires = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      const id = randomBytes(18).toString('base64url');
+      db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,product_name,status,source_type,started_at,expires_at)
+        VALUES(?,?,?,'Тестовая подписка','active','test',?,?)`).run(id, user.id, 'test_access', now.toISOString(), expires);
+      return send(res, 201, { subscription: { id, product_id: 'test_access', product_name: 'Тестовая подписка', status: 'active', source_type: 'test', started_at: now.toISOString(), expires_at: expires } });
+    }
     if (url.pathname === '/api/payments/crypto/create' && req.method === 'POST') {
       requireUser(user);
       if (!cryptoPayToken) return send(res, 503, { error: 'Оплата пока не настроена. Нужен API-токен приложения Crypto Pay.' });
@@ -284,8 +337,9 @@ const server = createServer(async (req, res) => {
       const cred = passwordHash(password);
       const storedEmail = email || `local-${randomBytes(16).toString('hex')}@nexora.invalid`;
       let info;
-      try { info = db.prepare(`INSERT INTO users(username,email,password_salt,password_hash,role,created_at)
-        VALUES(?,?,?,?,'user',?)`).run(username, storedEmail, cred.salt, cred.hash, new Date().toISOString()); }
+      const createdAt = new Date().toISOString();
+      try { info = db.prepare(`INSERT INTO users(username,email,password_salt,password_hash,role,created_at,last_login_at)
+        VALUES(?,?,?,?,'user',?,?)`).run(username, storedEmail, cred.salt, cred.hash, createdAt, createdAt); }
       catch (e) { if (String(e.message).includes('UNIQUE')) return send(res, 409, { error: 'Ник или email уже используется.' }); throw e; }
       createSession(Number(info.lastInsertRowid), res);
       const created = db.prepare('SELECT id,username,email,role FROM users WHERE id=?').get(Number(info.lastInsertRowid));
@@ -298,6 +352,7 @@ const server = createServer(async (req, res) => {
       const row = db.prepare('SELECT id,username,email,role,password_salt,password_hash FROM users').all()
         .find(account => account.username.normalize('NFKC').toLocaleLowerCase('ru-RU') === identifierKey || account.email.toLowerCase() === identifier.toLowerCase());
       if (!row || !passwordMatches(password, row.password_salt, row.password_hash)) return send(res, 401, { error: 'Неверный ник/email или пароль.' });
+      db.prepare('UPDATE users SET last_login_at=? WHERE id=?').run(new Date().toISOString(), row.id);
       createSession(row.id, res);
       return send(res, 200, { user: { id: row.id, username: row.username, email: row.email, role: row.role } });
     }

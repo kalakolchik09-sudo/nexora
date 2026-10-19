@@ -278,7 +278,8 @@ const server = createServer(async (req, res) => {
       return send(res, 200, {
         account: { ...account, email: account.email.endsWith('.nexora.invalid') ? '' : account.email, hwid: null },
         subscriptions: subscriptions.map(item => ({ ...item, status: item.expires_at && Date.parse(item.expires_at) <= Date.now() && item.status === 'active' ? 'expired' : item.status })),
-        orders
+        orders,
+        testSubscriptionClaimed: !!db.prepare('SELECT 1 FROM test_subscription_claims WHERE user_id=?').get(user.id)
       });
     }
     if (url.pathname === '/api/purchases/free-test' && req.method === 'POST') {

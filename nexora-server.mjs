@@ -296,7 +296,6 @@ const server = createServer(async (req, res) => {
         account: { ...account, email: account.email.endsWith('.nexora.invalid') ? '' : account.email, hwid: null },
         subscriptions: subscriptions.map(item => ({ ...item, status: item.expires_at && Date.parse(item.expires_at) <= Date.now() && item.status === 'active' ? 'expired' : item.status })),
         orders,
-        testSubscriptionClaimed: false
       });
     }
     if (url.pathname === '/api/profile/subscriptions/cancel' && req.method === 'POST') {
@@ -378,27 +377,7 @@ const server = createServer(async (req, res) => {
       return send(res, 201, { code, product: product.name, maxUses, expiresAt });
     }
     if (url.pathname === '/api/purchases/free-test' && req.method === 'POST') {
-      requireUser(user);
-      const now = new Date().toISOString();
-      const expires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-      const orderId = randomBytes(18).toString('base64url');
-      const subscriptionId = randomBytes(18).toString('base64url');
-      db.exec('BEGIN IMMEDIATE');
-      try {
-        db.prepare(`INSERT INTO orders(id,user_id,product_id,product_name,amount_rub,status,created_at,paid_at)
-          VALUES(?,?,'test_access','Тестовая подписка',0,'paid',?,?)`).run(orderId, user.id, now, now);
-        db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,product_name,status,source_type,source_order_id,started_at,expires_at)
-          VALUES(?,?,'test_access','Тестовая подписка','active','test',?,?,?)`)
-          .run(subscriptionId, user.id, orderId, now, expires);
-        db.exec('COMMIT');
-      } catch (error) {
-        db.exec('ROLLBACK');
-        throw error;
-      }
-      return send(res, 201, {
-        order: { id: orderId, product_name: 'Тестовая подписка', amount_rub: 0, status: 'paid', created_at: now, paid_at: now },
-        subscription: { id: subscriptionId, product_id: 'test_access', product_name: 'Тестовая подписка', status: 'active', source_type: 'test', started_at: now, expires_at: expires }
-      });
+      return send(res, 410, { error: 'Тестовый доступ больше не предлагается.' });
     }
     if (url.pathname === '/api/payments/crypto/create' && req.method === 'POST') {
       requireUser(user);

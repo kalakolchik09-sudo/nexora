@@ -296,7 +296,7 @@ const server = createServer(async (req, res) => {
         account: { ...account, email: account.email.endsWith('.nexora.invalid') ? '' : account.email, hwid: null },
         subscriptions: subscriptions.map(item => ({ ...item, status: item.expires_at && Date.parse(item.expires_at) <= Date.now() && item.status === 'active' ? 'expired' : item.status })),
         orders,
-        testSubscriptionClaimed: !!db.prepare('SELECT 1 FROM test_subscription_claims WHERE user_id=?').get(user.id)
+        testSubscriptionClaimed: false
       });
     }
     if (url.pathname === '/api/profile/subscriptions/cancel' && req.method === 'POST') {
@@ -385,11 +385,6 @@ const server = createServer(async (req, res) => {
       const subscriptionId = randomBytes(18).toString('base64url');
       db.exec('BEGIN IMMEDIATE');
       try {
-        const claimed = db.prepare('INSERT OR IGNORE INTO test_subscription_claims(user_id,claimed_at) VALUES(?,?)').run(user.id, now);
-        if (!claimed.changes) {
-          db.exec('ROLLBACK');
-          return send(res, 409, { error: 'Тестовую подписку можно оформить только один раз на аккаунт.' });
-        }
         db.prepare(`INSERT INTO orders(id,user_id,product_id,product_name,amount_rub,status,created_at,paid_at)
           VALUES(?,?,'test_access','Тестовая подписка',0,'paid',?,?)`).run(orderId, user.id, now, now);
         db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,product_name,status,source_type,source_order_id,started_at,expires_at)

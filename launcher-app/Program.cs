@@ -234,7 +234,7 @@ internal sealed class LauncherWindow : Window
                 MaximumRamMb = Math.Clamp((int)(GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / 1024 / 1024 / 3), 2048, 8192)
             });
             process.Start();
-            Dispatcher.BeginInvoke(() => WindowState = WindowState.Minimized);
+            _ = Dispatcher.BeginInvoke(() => WindowState = WindowState.Minimized);
             SendLauncherStatus($"Minecraft {version} запущен.");
         }
         catch (Exception error)

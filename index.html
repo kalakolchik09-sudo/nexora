@@ -217,14 +217,17 @@ button,a,input,select,textarea{-webkit-tap-highlight-color:transparent}
  .p1,.p2,.p3,.p4{display:none}
  #mol{width:min(66vw,300px);height:auto;opacity:.28}
  section{padding:74px 15px 46px}
+ section.page{padding:170px 15px 46px;scroll-margin-top:150px}
  h2{font-size:clamp(26px,7vw,34px);margin-bottom:22px}
  .sub{margin-top:-10px;margin-bottom:18px;font-size:13px;line-height:1.55}
  .grid,.pricing-grid{grid-template-columns:minmax(0,1fr);gap:12px}
  .card{padding:18px}
  .gui{border-radius:16px;margin-bottom:28px}
- .side{flex-direction:column;align-items:stretch;border:0;border-bottom:1px solid var(--line);overflow:hidden}
- .side-cats{width:100%;padding-bottom:3px}
- .side-bottom{justify-content:flex-end}
+ .side{flex-direction:row;align-items:center;border:0;border-bottom:1px solid var(--line);overflow:hidden;min-height:0;padding:7px;gap:6px}
+ .side-cats{width:auto;flex:1;display:flex;flex-direction:row;align-items:center;white-space:nowrap;overflow-x:auto;overflow-y:hidden;padding-bottom:2px}
+ .side-cats button{flex:none;padding:8px 9px;font-size:12px}
+ .side-bottom{justify-content:flex-end;margin:0;padding:0;border:0;flex:none}
+ .side-brand{display:none}
  .main{padding:12px;max-height:none;overflow:visible}
  .top{gap:8px;margin-bottom:10px}
  .searchbox{width:100%;flex:1 0 100%;margin-left:0}
@@ -281,6 +284,7 @@ button,a,input,select,textarea{-webkit-tap-highlight-color:transparent}
 @media(max-width:380px){
  nav{padding-inline:10px}
  nav .links{font-size:11px;column-gap:4px}
+ section.page{padding-top:178px}
  .logo{font-size:13px}
  .hero h1{font-size:37px}
  .product-buy{align-items:stretch;flex-direction:column}

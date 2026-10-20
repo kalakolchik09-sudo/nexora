@@ -12,6 +12,9 @@ using CmlLib.Core.Auth;
 using CmlLib.Core.Auth.Microsoft;
 using CmlLib.Core.ProcessBuilder;
 using CmlLib.Core.ModLoaders.FabricMC;
+using XboxAuthNet.Game.Msal;
+using XboxAuthNet.Game.Msal.OAuth;
+using XboxAuthNet.XboxLive;
 
 namespace NexoraLauncher;
 
@@ -213,9 +216,8 @@ internal sealed class LauncherWindow : Window
         _launchInProgress = true;
         try
         {
-            SendLauncherStatus("Выполняется вход в Microsoft. Войди в аккаунт с лицензией Minecraft: Java Edition.");
-            _minecraftSession ??= await _minecraftLogin.AuthenticateInteractively(
-                _minecraftLogin.AccountManager.NewAccount());
+            SendLauncherStatus("Подготовка безопасного входа Microsoft…");
+            _minecraftSession ??= await AuthenticateMinecraftAccountAsync();
 
             var gamePath = new MinecraftPath(Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -247,6 +249,26 @@ internal sealed class LauncherWindow : Window
         {
             _launchInProgress = false;
         }
+    }
+
+    private async Task<MSession> AuthenticateMinecraftAccountAsync()
+    {
+        const string publicClientId = "499c8d36-be2a-4231-9ebd-ef291b7bb64c";
+        var msalApp = await MsalClientHelper.BuildApplicationWithCache(publicClientId);
+        var authenticator = _minecraftLogin.CreateAuthenticatorWithNewAccount();
+        authenticator.AddMsalOAuth(msalApp, msal => msal.DeviceCode(code =>
+        {
+            Dispatcher.Invoke(() => MessageBox.Show(
+                this,
+                code.Message + "\n\nВойди в аккаунт с лицензией Minecraft: Java Edition.",
+                "Вход в Minecraft",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information));
+            return Task.CompletedTask;
+        }));
+        authenticator.AddXboxAuthForJE(xbox => xbox.Basic());
+        authenticator.AddForceJEAuthenticator();
+        return await authenticator.ExecuteForLauncherAsync();
     }
 
     private void SendLauncherStatus(string message, bool isError = false)

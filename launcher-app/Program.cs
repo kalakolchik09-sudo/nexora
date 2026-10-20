@@ -214,7 +214,8 @@ internal sealed class LauncherWindow : Window
         try
         {
             SendLauncherStatus("Выполняется вход в Microsoft. Войди в аккаунт с лицензией Minecraft: Java Edition.");
-            _minecraftSession ??= await _minecraftLogin.Authenticate();
+            _minecraftSession ??= await _minecraftLogin.AuthenticateInteractively(
+                _minecraftLogin.AccountManager.NewAccount());
 
             var gamePath = new MinecraftPath(Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),

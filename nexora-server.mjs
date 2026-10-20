@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const htmlPath = process.env.NEXORA_HTML || path.join(here, 'index.html');
+const launcherHtmlPath = process.env.NEXORA_LAUNCHER_HTML || path.join(here, 'launcher.html');
 const dbPath = process.env.NEXORA_DB || path.join(here, 'nexora.sqlite');
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || '127.0.0.1';
@@ -241,6 +242,11 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
       return res.end(readFileSync(htmlPath));
+    }
+    if (url.pathname === '/launcher' && req.method === 'GET') {
+      if (!existsSync(launcherHtmlPath)) return send(res, 503, { error: 'Страница лаунчера не установлена.' });
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin' });
+      return res.end(readFileSync(launcherHtmlPath));
     }
     if (!url.pathname.startsWith('/api/')) return send(res, 404, { error: 'Not found' });
 
